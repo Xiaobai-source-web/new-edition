@@ -1,0 +1,33 @@
+# Python bytecode and local virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+ENV/
+
+# Runtime-generated upload history
+uploaded_history/
+chat_history/
+
+# Streamlit local config
+.streamlit/secrets.toml
+.streamlit/config.toml
+
+# Temporary / export files
+*.html
+*.png
+*.csv
+*.log
+
+# Editor / IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+desktop.ini
