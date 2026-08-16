@@ -3,6 +3,8 @@
 增强点：
 1. API 调用重试机制（偶发网络波动自动重试，业务错误不重试）
 2. 节点进度回调（实时通知调用方当前执行到哪个节点，用于 UI 进度反馈）
+3. 完整事件处理：PING / message_replace / agent_message / node_finished 等
+4. 工作流卡住（PENDING / 人工介入）时的超时提示
 """
 
 from __future__ import annotations
@@ -167,10 +169,14 @@ def _do_stream_request(
     """执行一次流式请求，返回 (文字描述, structured_output, conversation_id)。
 
     遇到网络错误/超时抛出对应异常（由上层重试）；遇到业务 error 事件抛出 _BusinessError。
+    当工作流触发人工介入（PENDING）导致卡住时，在 answer_text 中给出明确提示。
     """
     answer_parts: list[str] = []
     structured_output: Dict[str, Any] = {}
     new_conversation_id: str | None = None
+    last_node_title: str = ""
+    last_progress_time = time.time()
+    got_message_end = False
 
     with requests.post(
         DIFY_CHATFLOW_URL,
@@ -182,6 +188,14 @@ def _do_stream_request(
         resp.raise_for_status()
         for raw_line in resp.iter_lines():
             if not raw_line:
+                # 空行时检查是否长时间卡住（超过 180 秒没事件就当卡住了）
+                if last_node_title and time.time() - last_progress_time > 180:
+                    answer_parts.append(
+                        f"\n\n⚠️ 工作流执行时间过长，已停留在「{last_node_title}」阶段超过 3 分钟。"
+                        " 可能原因：① Dify 工作流触发了人工介入节点，请在 Dify 后台处理后重试；"
+                        " ② 项目参数过于复杂，建议拆分成多个小步骤提交。"
+                    )
+                    break
                 continue
             try:
                 line = raw_line.decode("utf-8")
@@ -197,9 +211,22 @@ def _do_stream_request(
             except json.JSONDecodeError:
                 continue
             event = evt.get("event")
+
             if event == "message":
+                # 增量推送的文字片段
                 answer_parts.append(evt.get("answer", ""))
+
+            elif event == "message_replace":
+                # Dify 有时会用整段新文本替换之前返回的内容
+                new_text = evt.get("answer") or ""
+                answer_parts = [new_text]
+
+            elif event == "agent_message":
+                # Agent 模式下的文字输出
+                answer_parts.append(evt.get("answer", ""))
+
             elif event == "message_end":
+                got_message_end = True
                 new_conversation_id = evt.get("conversation_id")
                 metadata = evt.get("metadata") or {}
                 # Dify 工作流 answer 节点中若有结构化输出，优先从 outputs 拿
@@ -207,11 +234,16 @@ def _do_stream_request(
                 if not outputs:
                     outputs = evt.get("outputs") or {}
                 if isinstance(outputs, dict):
-                    # 优先找 structured_output 字段；兼容某些节点命名 structured_output / plan
+                    # 兼容某些节点直接把 fields 放进 outputs（如 structured_output / plan）
                     for key in ("structured_output", "plan", "output"):
                         if key in outputs and isinstance(outputs[key], dict):
                             structured_output = outputs[key]
                             break
+                    # 兼容：outputs 本身就是 structured_output（无外层 key）
+                    if not structured_output and (
+                        "overview" in outputs and "all_tasks_schedule" in outputs
+                    ):
+                        structured_output = outputs
                     if not structured_output and "text" in outputs:
                         candidate = _try_parse_structured_from_text(str(outputs["text"]))
                         if candidate:
@@ -220,24 +252,76 @@ def _do_stream_request(
                     candidate = _try_parse_structured_from_text("".join(answer_parts))
                     if candidate:
                         structured_output = candidate
-            elif event == "node_started":
+
+            elif event in ("node_started", "workflow_node_started"):
                 # 节点开始事件：通知 UI 当前执行到哪个节点
                 if on_progress:
                     node_data = evt.get("data") or {}
                     node_title = node_data.get("title") or ""
+                    if not node_title:
+                        # 有些版本的 Dify 把 title 放在顶层
+                        node_title = evt.get("node_title") or ""
+                    last_node_title = node_title
+                    last_progress_time = time.time()
                     progress_text = _NODE_TITLE_MAP.get(node_title)
                     if progress_text:
                         on_progress(progress_text)
+                    else:
+                        # 未知节点也显示原文，让用户知道在执行什么
+                        if node_title:
+                            on_progress(f"正在执行：{node_title}...")
+
+            elif event in ("node_finished", "workflow_node_finished"):
+                last_progress_time = time.time()
+
             elif event == "workflow_started":
+                last_progress_time = time.time()
                 if on_progress:
                     on_progress("AI 开始处理您的请求...")
+
             elif event == "workflow_finished":
+                last_progress_time = time.time()
                 if on_progress:
                     on_progress("处理完成，正在整理结果...")
+                # 兼容某些 Dify 版本：workflow_finished 里可能带 outputs
+                wf_data = evt.get("data") or {}
+                if isinstance(wf_data, dict) and not structured_output:
+                    outputs = wf_data.get("outputs") or {}
+                    if isinstance(outputs, dict):
+                        for key in ("structured_output", "plan", "output"):
+                            if key in outputs and isinstance(outputs[key], dict):
+                                structured_output = outputs[key]
+                                break
+
+            elif event == "ping":
+                # 心跳事件，刷新最后活跃时间
+                last_progress_time = time.time()
+
             elif event == "error":
-                raise _BusinessError(f"Dify 返回错误：{evt.get('message', '未知错误')}")
+                msg = evt.get("message", "未知错误")
+                # 遇到错误时先尝试从已有的 answer_parts 中提取 structured_output
+                if answer_parts and not structured_output:
+                    candidate = _try_parse_structured_from_text("".join(answer_parts))
+                    if candidate:
+                        structured_output = candidate
+                raise _BusinessError(f"Dify 返回错误：{msg}")
+
+            # 其他未识别事件：不做处理，但刷新时间（避免被当成卡住）
+            else:
+                last_progress_time = time.time()
 
     answer_text = "".join(answer_parts).strip()
+
+    # 如果没收到 message_end，说明流式被异常中断或人工介入卡住了
+    if not got_message_end and not answer_text:
+        stuck_msg = (
+            "⚠️ AI 工作流未正常结束。可能原因：\n"
+            "① Dify 工作流触发了人工介入节点（PENDING 状态），请在 Dify 后台查看日志并处理；\n"
+            "② 工作流某个节点执行出错，检查代码节点或 LLM Prompt；\n"
+            "③ 工作流最新版本未发布，API 仍在调用旧版本，请确认 Dify 编辑器右上角已点「发布」。"
+        )
+        answer_text = stuck_msg
+
     return answer_text, structured_output, new_conversation_id
 
 
@@ -262,9 +346,6 @@ def _try_parse_structured_from_text(text: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # 直接匹配包含关键字段的 JSON 对象
-    for m in re.finditer(r"\{[^{}]*\"(overview|all_tasks_schedule)\"[^{}]*\}", text, re.DOTALL):
-        pass  # 防止贪婪匹配；改用手动切分
     start = text.find("{")
     while start != -1:
         depth = 0
