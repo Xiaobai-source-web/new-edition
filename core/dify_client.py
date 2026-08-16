@@ -375,14 +375,33 @@ def _do_stream_request(
                     candidate_len = len(candidate)
                     # 识别策略：大型（>200）且含关键字段的 JSON 一律视为进度计划数据
                     plan_keywords = (
+                        # --- 生成场景字段 ---
                         "overview",
                         "all_tasks_schedule",
                         "structured_output",
                         "project_name",
                         "planned_start_date",
+                        "planned_end_date",
                         "critical_path_tasks",
                         "key_milestones",
                         "resource_plan",
+                        "section_code",
+                        "assigned_resources",
+                        # --- 优化/调整场景外层 key ---
+                        "adjusted_plan",
+                        "optimized_plan",
+                        "updated_plan",
+                        "updated_schedule",
+                        "adjusted_schedule",
+                        "optimized_schedule",
+                        "new_schedule",
+                        "final_plan",
+                        "delay_adjusted_plan",
+                        # --- 优化场景中文描述（常作为key）---
+                        "优化后计划",
+                        "调整后进度",
+                        "延误调整计划",
+                        "压缩后计划",
                     )
                     hit_count = sum(1 for kw in plan_keywords if kw in candidate)
                     if candidate_len > 200 and hit_count >= 2:
@@ -421,18 +440,41 @@ def _do_stream_request(
         lines = cleaned.splitlines()
         filtered_lines = []
         skip_keywords = (
+            # --- JSON / 结构化输出相关 ---
             "json",
             "JSON",
             "进度计划数据",
             "结构化输出",
             "structured_output",
             "all_tasks_schedule",
+            "adjusted_plan",
+            "optimized_plan",
+            "updated_plan",
+            # --- 通用引导语 ---
             "下面是",
             "如下为",
             "以下为",
             "请复制",
             "请保存为",
             "```",
+            # --- 优化场景引导语 ---
+            "优化后计划如下",
+            "调整后计划如下",
+            "延误调整后计划",
+            "压缩后计划",
+            "更新的进度计划",
+            "方案数据如下",
+            "绘图数据",
+            "供系统绘图使用",
+            "系统内部使用",
+            "数据结构",
+            "以下JSON",
+            "详细数据",
+            "数据内容",
+            "JSON格式",
+            "json格式",
+            "仅供系统",
+            "供绘图使用",
         )
         for line in lines:
             stripped = line.strip()
@@ -477,19 +519,72 @@ def _try_parse_structured_from_text(text: str) -> Dict[str, Any]:
 
     搜索顺序：
     1) ```json ... ``` 代码块
-    2) 第一个以 { 开头 且 包含 overview 或 all_tasks_schedule 的 JSON
+    2) 全文扫描，对每个完整 JSON 对象尝试解析 + 解包外层包装
+
+    支持多种外层包装：{structured_output, adjusted_plan, optimized_plan, ...}
+    最终返回统一格式：{overview, all_tasks_schedule, ...}（扁平结构），
+    上层 normalize_to_wrapped 会再把它包装成 {structured_output: ...}。
     """
     if not text:
         return {}
 
     import re
 
+    def _unwrap_any_plan(data: Any) -> Dict[str, Any]:
+        """从任意形式（含多种外层 key / 多层嵌套）的 data 中解出实际的 plan dict。
+
+        返回的 dict 直接包含 overview / all_tasks_schedule（扁平形式）。
+        如果解不出来，返回空 dict {}。
+        """
+        if not isinstance(data, dict):
+            return {}
+
+        # 形式 A：data 本身就是扁平计划
+        if "overview" in data and "all_tasks_schedule" in data:
+            return data
+
+        # 形式 B：含多种常见外层 key
+        outer_keys = (
+            "structured_output",
+            "plan",
+            "output",
+            "result",
+            "adjusted_plan",
+            "optimized_plan",
+            "updated_plan",
+            "updated_schedule",
+            "adjusted_schedule",
+            "optimized_schedule",
+            "new_schedule",
+            "final_plan",
+            "delay_adjusted_plan",
+            "generated_plan",
+            "progress_plan",
+        )
+        for key in outer_keys:
+            inner = data.get(key)
+            if isinstance(inner, dict):
+                if "overview" in inner and "all_tasks_schedule" in inner:
+                    return inner
+                # 可能还有一层，递归解一次
+                deeper = _unwrap_any_plan(inner)
+                if deeper:
+                    return deeper
+
+        # 形式 C：再兜底扫一遍所有 dict 值，看看有没有值是 {overview, all_tasks_schedule}
+        for v in data.values():
+            if isinstance(v, dict) and "overview" in v and "all_tasks_schedule" in v:
+                return v
+
+        return {}
+
     code_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
     if code_match:
         try:
             data = json.loads(code_match.group(1))
-            if _looks_like_plan(data):
-                return data
+            unwrapped = _unwrap_any_plan(data)
+            if unwrapped:
+                return unwrapped
         except Exception:
             pass
 
@@ -522,8 +617,9 @@ def _try_parse_structured_from_text(text: str) -> Dict[str, Any]:
         if end != -1:
             try:
                 data = json.loads(text[start:end + 1])
-                if _looks_like_plan(data):
-                    return data
+                unwrapped = _unwrap_any_plan(data)
+                if unwrapped:
+                    return unwrapped
             except Exception:
                 pass
             start = text.find("{", end + 1)
@@ -533,11 +629,35 @@ def _try_parse_structured_from_text(text: str) -> Dict[str, Any]:
 
 
 def _looks_like_plan(data: Any) -> bool:
+    """兼容任意外层 key（structured_output / adjusted_plan 等）。"""
     if not isinstance(data, dict):
         return False
-    # 完整形式 {structured_output: {...}}
-    if isinstance(data.get("structured_output"), dict):
-        inner = data["structured_output"]
-        return "overview" in inner and "all_tasks_schedule" in inner
-    # 扁平形式 {...}
-    return "overview" in data and "all_tasks_schedule" in data
+
+    def _has_core_fields(d: dict) -> bool:
+        return "overview" in d and "all_tasks_schedule" in d
+
+    if _has_core_fields(data):
+        return True
+
+    outer_keys = (
+        "structured_output",
+        "plan",
+        "output",
+        "result",
+        "adjusted_plan",
+        "optimized_plan",
+        "updated_plan",
+        "updated_schedule",
+        "adjusted_schedule",
+        "optimized_schedule",
+        "new_schedule",
+        "final_plan",
+        "delay_adjusted_plan",
+        "generated_plan",
+        "progress_plan",
+    )
+    for key in outer_keys:
+        inner = data.get(key)
+        if isinstance(inner, dict) and _has_core_fields(inner):
+            return True
+    return False
