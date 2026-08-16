@@ -1339,48 +1339,56 @@ def main():
         df_json = pd.DataFrame(json_fields)
         _render_centered_table(df_json)
 
-    # ==================== 下方：示范项目（名创优品）+ 用户加载的图表 ====================
+    # ==================== 下方：用户计划 / 名创优品示范（二者择一展示）====================
     st.markdown("---")
-    
-    # 自动加载名创优品示范项目
-    demo_path = DEMO_PLAN_PATH
-    if demo_path.exists():
-        if "demo_data" not in st.session_state:
-            try:
-                demo_data_raw = load_json_from_file(demo_path)
-                is_valid, msg = validate_data_structure(demo_data_raw)
-                if is_valid:
-                    st.session_state.demo_data = normalize_to_wrapped(demo_data_raw)
-                else:
-                    st.warning(f"示范文件验证失败：{msg}")
-            except Exception as e:
-                st.warning(f"加载示范文件失败：{str(e)}")
-        
-        if "demo_data" in st.session_state and st.session_state.demo_data:
-            st.markdown("""
-            <div style="background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%); border-left: 4px solid #0ea5e9; padding: 14px 18px; border-radius: 6px;">
-                <div style="font-weight: 600; color: #0369a1; font-size: 1.1rem;">🏗️ 示范项目：名创优品施工进度计划</div>
-                <div style="color: #075985; font-size: 0.9rem; margin-top: 4px;">
-                    下方展示名创优品项目的完整进度计划图表，用于演示本网页的各项功能。<br>
-                    您也可以上传自己的 JSON 文件查看其他项目的进度计划。
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-            render_plan_full(st.session_state.demo_data, current_version="demo")
 
-    # 如果用户加载了其他文件，也展示
-    if st.session_state.current_version and st.session_state.current_version in st.session_state.data_versions:
-        if st.session_state.current_version != "demo":
-            st.markdown("---")
-            st.markdown(f"""
-            <div style="background: #fef3c7; border-left: 4px solid #f59e0b; padding: 12px 16px; border-radius: 6px; margin-bottom: 10px;">
-                <div style="font-weight: 600; color: #b45309;">📊 已加载的进度计划：{st.session_state.current_version}</div>
+    has_user_plan = bool(
+        st.session_state.current_version
+        and st.session_state.current_version in st.session_state.data_versions
+    )
+
+    if has_user_plan:
+        # 有用户生成/上传的计划 → 只展示用户计划，不再展示名创优品示范
+        plan_name = st.session_state.current_version
+        st.markdown(f"""
+        <div style="background: #fef3c7; border-left: 4px solid #f59e0b; padding: 12px 16px; border-radius: 6px; margin-bottom: 10px;">
+            <div style="font-weight: 600; color: #b45309; font-size: 1.1rem;">📊 当前进度计划：{plan_name}</div>
+            <div style="color: #92400e; font-size: 0.9rem; margin-top: 4px;">
+                这是您通过 AI 生成或上传的进度计划，已自动替代默认示范项目。
             </div>
-            """, unsafe_allow_html=True)
-            current_data = st.session_state.data_versions[st.session_state.current_version]
-            render_plan_full(current_data, current_version=st.session_state.current_version)
-    elif not demo_path.exists():
-        st.info("请通过左侧上传区传入 JSON 进度计划文件，或从历史文件列表加载")
+        </div>
+        """, unsafe_allow_html=True)
+        current_data = st.session_state.data_versions[plan_name]
+        render_plan_full(current_data, current_version=plan_name)
+
+    else:
+        # 无用户计划 → 展示名创优品示范项目
+        demo_path = DEMO_PLAN_PATH
+        if demo_path.exists():
+            if "demo_data" not in st.session_state:
+                try:
+                    demo_data_raw = load_json_from_file(demo_path)
+                    is_valid, msg = validate_data_structure(demo_data_raw)
+                    if is_valid:
+                        st.session_state.demo_data = normalize_to_wrapped(demo_data_raw)
+                    else:
+                        st.warning(f"示范文件验证失败：{msg}")
+                except Exception as e:
+                    st.warning(f"加载示范文件失败：{str(e)}")
+
+            if "demo_data" in st.session_state and st.session_state.demo_data:
+                st.markdown("""
+                <div style="background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%); border-left: 4px solid #0ea5e9; padding: 14px 18px; border-radius: 6px;">
+                    <div style="font-weight: 600; color: #0369a1; font-size: 1.1rem;">🏗️ 示范项目：名创优品施工进度计划</div>
+                    <div style="color: #075985; font-size: 0.9rem; margin-top: 4px;">
+                        暂无您自己的进度计划，下方展示「名创优品」项目的完整图表用于演示功能。<br>
+                        在右侧聊天框输入项目参数或上传文档，即可生成属于您的进度计划并自动替换此处。
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                render_plan_full(st.session_state.demo_data, current_version="demo")
+        else:
+            st.info("请通过右侧聊天框输入项目参数（或上传 Word 文档）生成进度计划，也可在左侧上传区传入 JSON 文件。")
 
     # ==================== 开发者印记 ====================
     st.markdown("---")
