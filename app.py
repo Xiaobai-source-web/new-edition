@@ -52,6 +52,27 @@ def _format_short_date(dt):
         return str(dt)
 
 
+def _section_sort_key(code):
+    """把 section_code 转成可排序的 hashable key（tuple），兼容纯数字（1, 2）和字母+数字（WP1-1）两种格式。"""
+    import re
+    code_str = str(code).strip()
+    parts = []
+    for token in re.split(r"(\d+)", code_str):
+        if token == "":
+            continue
+        if token.isdigit():
+            parts.append(("", int(token)))
+        else:
+            for sub in re.split(r"(\D+)", token):
+                if sub == "":
+                    continue
+                if sub.isdigit():
+                    parts.append(("", int(sub)))
+                else:
+                    parts.append((sub, 0))
+    return tuple(parts) if parts else (("", 0),)
+
+
 def _build_gantt_data(tasks_df, section_filter=None):
     if section_filter and len(section_filter) > 0:
         filtered_df = tasks_df[tasks_df["section_code"].isin(section_filter)].copy()
@@ -63,23 +84,28 @@ def _build_gantt_data(tasks_df, section_filter=None):
     plot_df = filtered_df.copy()
     plot_df["Start"] = pd.to_datetime(plot_df["start_date"])
     plot_df["Finish"] = pd.to_datetime(plot_df["finish_date"])
-    plot_df["_sec_num"] = plot_df["section_code"].astype(int)
-    plot_df = plot_df.sort_values(["_sec_num", "task_id"]).reset_index(drop=True)
+    # 兼容 section_code 是纯数字或字符串（WP1-1）两种格式
+    plot_df["_sec_code_raw"] = plot_df["section_code"].astype(str)
+    plot_df["_sec_key"] = plot_df["_sec_code_raw"].apply(_section_sort_key)
+    # task_id 也按自然排序，避免 1.10 排在 1.2 之前
+    plot_df["_task_key"] = plot_df["task_id"].astype(str).apply(_section_sort_key)
+    plot_df = plot_df.sort_values(["_sec_key", "_task_key"]).reset_index(drop=True)
 
     sections = []
-    for code, grp in plot_df.groupby("_sec_num", sort=True):
+    for code, grp in plot_df.groupby("_sec_code_raw", sort=False):
         sec_start = grp["Start"].min()
         sec_finish = grp["Finish"].max()
         sec_duration = (sec_finish - sec_start).days + 1
         sections.append({
-            "code": str(int(code)),
+            "code": str(code),
             "count": len(grp),
             "Start": sec_start,
             "Finish": sec_finish,
             "duration": sec_duration,
             "children": grp,
+            "_sec_key": _section_sort_key(code),
         })
-    sections.sort(key=lambda s: int(s["code"]))
+    sections.sort(key=lambda s: s["_sec_key"])
 
     ordered_rows = []
     for sec in sections:
@@ -766,7 +792,7 @@ def render_chat_panel():
 
     # ====== 快捷指令按钮 ======
     st.markdown("""
-    <div style="margin-bottom: 6px; color: #64748b; font-size: 0.8rem;">
+    <div style="margin-bottom: 2px; color: #64748b; font-size: 0.8rem;">
         ⚡ 快捷指令（点击即可填充到输入框）：
     </div>
     """, unsafe_allow_html=True)
@@ -828,34 +854,16 @@ def render_chat_panel():
                 st.session_state.chat_messages.append({"role": "assistant", "content": summary})
                 st.rerun()
 
-    # 聊天消息显示
-    chat_area = st.container(height=480, border=False)
-    with chat_area:
-        for msg in st.session_state.chat_messages:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
-
-    # 附件上传（支持 word / 文本）
-    attach_col, _ = st.columns([3, 2])
-    with attach_col:
-        attach_files = st.file_uploader(
-            "📎 可选：附加项目文档（Word / TXT / JSON 等）",
-            type=["docx", "txt", "json", "doc"],
-            accept_multiple_files=True,
-            key="chat_attachments",
-            help="功能：把项目参数 Word 文档或其它说明性文件传给 AI，辅助生成/调整进度计划。操作方法：点击选择文件，最多可上传 5 个；发送消息时会一并提交。",
-        )
-
     # 处理快捷指令：点击后显示可编辑文本框，用户可修改模板后再发送
     pending_template = st.session_state.get("pending_input")
     if pending_template:
-        # 编辑模式：显示预填充的文本框 + 发送/取消按钮
+        # 编辑模式：显示预填充的文本框 + 发送/取消按钮（放前面，更靠近蓝框）
         edit_col, btn_col1, btn_col2 = st.columns([6, 1, 1])
         with edit_col:
             edited_text = st.text_area(
                 "✏️ 编辑请求内容（可直接修改后发送）",
                 value=pending_template,
-                height=150,
+                height=220,
                 key="quick_edit_area",
                 help="功能：快捷指令已填入模板，您可以在此基础上修改项目参数，然后点击「发送」。",
             )
@@ -863,6 +871,17 @@ def render_chat_panel():
             send_clicked = st.button("📤 发送", key="quick_send", type="primary")
         with btn_col2:
             cancel_clicked = st.button("✖ 取消", key="quick_cancel")
+
+        # 附件上传（编辑模式，放在编辑框下面）
+        attach_col, _ = st.columns([3, 2])
+        with attach_col:
+            attach_files = st.file_uploader(
+                "📎 可选：附加项目文档（Word / TXT / JSON 等）",
+                type=["docx", "txt", "json", "doc"],
+                accept_multiple_files=True,
+                key="chat_attachments_edit",
+                help="功能：把项目参数 Word 文档或其它说明性文件传给 AI，辅助生成/调整进度计划。操作方法：点击选择文件，最多可上传 5 个；发送消息时会一并提交。",
+            )
 
         if send_clicked and edited_text.strip():
             st.session_state.pop("pending_input", None)
@@ -873,11 +892,29 @@ def render_chat_panel():
         else:
             user_input = None
     else:
-        # 正常模式：使用 chat_input
+        # 正常模式：先附件上传，再使用 chat_input
+        attach_col, _ = st.columns([3, 2])
+        with attach_col:
+            attach_files = st.file_uploader(
+                "📎 可选：附加项目文档（Word / TXT / JSON 等）",
+                type=["docx", "txt", "json", "doc"],
+                accept_multiple_files=True,
+                key="chat_attachments",
+                help="功能：把项目参数 Word 文档或其它说明性文件传给 AI，辅助生成/调整进度计划。操作方法：点击选择文件，最多可上传 5 个；发送消息时会一并提交。",
+            )
         user_input = st.chat_input(
             "在此描述项目需求，例如：生成XX项目进度计划，总工期240天 / 暴雨导致桩基延迟3天，请调整",
             key="chat_user_input",
         )
+
+    # 聊天消息显示（放在最后，有消息时才占大高度，无消息时收缩）
+    msg_count = len(st.session_state.chat_messages)
+    chat_height = 60 if msg_count == 0 else max(500, msg_count * 80)
+    chat_area = st.container(height=chat_height, border=False)
+    with chat_area:
+        for msg in st.session_state.chat_messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
 
     if user_input:
         st.session_state.chat_messages.append({"role": "user", "content": user_input})
@@ -909,9 +946,21 @@ def render_chat_panel():
                     )
                     st.session_state.conversation_id = new_conv_id
                     status_placeholder.empty()
-                    message_placeholder.markdown(answer if answer else "(AI 未返回文字)")
 
-                    st.session_state.chat_messages.append({"role": "assistant", "content": answer or "(AI 未返回文字)"})
+                    # 若 answer 是 dify_client 的卡住提示文案（以 ⚠️ 开头），直接显示给用户
+                    display_text = answer or ""
+
+                    if not display_text:
+                        # 仍然没内容（极端情况），给一个兜底提示
+                        display_text = (
+                            "⚠️ AI 未返回内容。请检查：\n"
+                            "① Dify 工作流最新版本是否已点「发布」；\n"
+                            "② 代码节点输入/输出变量是否配置正确；\n"
+                            "③ 工作流执行日志中是否有报错节点。"
+                        )
+
+                    message_placeholder.markdown(display_text)
+                    st.session_state.chat_messages.append({"role": "assistant", "content": display_text})
 
                     # ====== 自动处理 structured_output ======
                     if structured_output:
@@ -928,10 +977,22 @@ def render_chat_panel():
                         else:
                             st.error(f"❌ AI 返回的进度计划数据格式不完整：{msg}")
                     else:
-                        if st.session_state.current_version:
+                        # 判断 answer 里是不是已经有卡住/错误提示文案（以 ⚠️ / ❌ 开头）
+                        already_has_error = bool(display_text) and (
+                            display_text.startswith("⚠️")
+                            or display_text.startswith("❌")
+                            or display_text.startswith("Dify 返回错误")
+                        )
+                        if already_has_error:
+                            # 已经给出错误提示了，不用再追加
+                            pass
+                        elif st.session_state.current_version:
                             st.info("ℹ️ 本次对话未返回可渲染的进度计划数据（可能只是文字建议），继续查看当前已加载的计划")
                         else:
-                            st.info("ℹ️ 本次对话仅返回文字说明。如需生成完整可渲染的进度计划，请补充项目参数（工程名称、总工期、开工日期等）后重新发送。")
+                            st.info(
+                                "ℹ️ 本次对话仅返回文字说明。如需生成完整可渲染的进度计划，"
+                                "请补充项目参数（工程名称、总工期、开工日期等）后重新发送。"
+                            )
 
                 except Exception as exc:  # noqa: BLE001
                     status_placeholder.empty()
