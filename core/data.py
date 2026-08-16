@@ -45,6 +45,27 @@ def normalize_to_wrapped(data):
     return data if isinstance(data.get("structured_output"), dict) else {"structured_output": data}
 
 
+def _section_sort_key(code):
+    """把 section_code 转成可排序的 hashable key（tuple），兼容纯数字（1, 2）和字母+数字（WP1-1）两种格式。"""
+    import re
+    code_str = str(code).strip()
+    parts = []
+    for token in re.split(r"(\d+)", code_str):
+        if token == "":
+            continue
+        if token.isdigit():
+            parts.append(("", int(token)))
+        else:
+            for sub in re.split(r"(\D+)", token):
+                if sub == "":
+                    continue
+                if sub.isdigit():
+                    parts.append(("", int(sub)))
+                else:
+                    parts.append((sub, 0))
+    return tuple(parts) if parts else (("", 0),)
+
+
 def extract_section_from_task_id(task_id):
     return str(task_id).split(".")[0]
 
@@ -59,7 +80,7 @@ def get_section_mapping(tasks):
     for task in tasks:
         code = extract_section_from_task_id(task["task_id"])
         sections.setdefault(code, section_names.get(code, f"分部{code}"))
-    return dict(sorted(sections.items(), key=lambda item: int(item[0]) if item[0].isdigit() else item[0]))
+    return dict(sorted(sections.items(), key=lambda item: _section_sort_key(item[0])))
 
 
 def get_critical_task_ids(critical_path_tasks):
