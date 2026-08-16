@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any, Callable, Dict, List, Tuple
 
@@ -311,6 +312,152 @@ def _do_stream_request(
                 last_progress_time = time.time()
 
     answer_text = "".join(answer_parts).strip()
+
+    # ====== 防御性清洗（多层、多策略）：把 answer_text 中的 JSON 彻底剔除 ======
+    # 即使 Dify 代码节点把 structured_output 漏进了 final_text，这里也会剥掉，
+    # 保证对话框里只给用户看中文，不显示 JSON。
+    if answer_text:
+        cleaned = answer_text
+
+        # ============ 第 1 层：删除 ```json ... ``` 等各种代码块 ============
+        # 1.1) 标准 ```json { ... } ``` 代码块
+        cleaned = re.sub(
+            r"```(?:json|JSON|structured_output)?\s*\{[\s\S]*?\}\s*```",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        # 1.2) 任意 ```xxx ... ``` 代码块（可能包裹 JSON）
+        cleaned = re.sub(r"```[\w\s-]*\s*[\s\S]*?\s*```", "", cleaned, flags=re.IGNORECASE)
+        # 1.3) 不闭合的 ```json 开头到文末
+        cleaned = re.sub(r"```(?:json)?\s*[\s\S]*$", "", cleaned, flags=re.IGNORECASE)
+
+        # ============ 第 2 层：用深度匹配删除所有「看起来像进度计划」的大型 JSON 对象 ============
+        #    （不仅删末尾的，全文扫描任何位置的）
+        def _strip_all_plan_json(s: str) -> str:
+            """全文扫描，删除所有大型进度计划 JSON 对象。"""
+            result_parts = []
+            i = 0
+            n = len(s)
+            while i < n:
+                c = s[i]
+                if c != "{":
+                    result_parts.append(c)
+                    i += 1
+                    continue
+                # 尝试解析以 i 开头的 JSON 对象（深度匹配）
+                depth = 0
+                end = -1
+                in_str = False
+                esc = False
+                for j in range(i, n):
+                    ch = s[j]
+                    if esc:
+                        esc = False
+                        continue
+                    if ch == "\\":
+                        esc = True
+                        continue
+                    if ch == '"':
+                        in_str = not in_str
+                        continue
+                    if in_str:
+                        continue
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            end = j
+                            break
+                if end != -1:
+                    candidate = s[i : end + 1]
+                    candidate_len = len(candidate)
+                    # 识别策略：大型（>200）且含关键字段的 JSON 一律视为进度计划数据
+                    plan_keywords = (
+                        "overview",
+                        "all_tasks_schedule",
+                        "structured_output",
+                        "project_name",
+                        "planned_start_date",
+                        "critical_path_tasks",
+                        "key_milestones",
+                        "resource_plan",
+                    )
+                    hit_count = sum(1 for kw in plan_keywords if kw in candidate)
+                    if candidate_len > 200 and hit_count >= 2:
+                        # 跳过这个 JSON，不写入 result_parts
+                        i = end + 1
+                        # JSON 前后的多余空白/换行/逗号一并吞掉
+                        while i < n and s[i] in " \t\r\n,，;；":
+                            i += 1
+                        # 回退：result_parts 末尾的多余空白也去掉
+                        while result_parts and result_parts[-1] in " \t\r\n":
+                            result_parts.pop()
+                        if result_parts:
+                            result_parts.append("\n")
+                        continue
+                    else:
+                        # 小 JSON 或不是进度结构的，保留原字符
+                        result_parts.append(c)
+                        i += 1
+                else:
+                    result_parts.append(c)
+                    i += 1
+            return "".join(result_parts)
+
+        cleaned = _strip_all_plan_json(cleaned)
+
+        # ============ 第 3 层：兜底清理「{structured_output: ...}」这种外层包裹 ============
+        #    以及一些残留的 JSON 碎片（如 "structured_output": {...} 片段）
+        def _strip_structured_wrapper(s: str) -> str:
+            """删除 structured_output 字段形式的 JSON 碎片。"""
+            pattern = r'"structured_output"\s*:\s*\{[\s\S]*\}\s*'
+            return re.sub(pattern, "", s, flags=re.DOTALL)
+
+        cleaned = _strip_structured_wrapper(cleaned)
+
+        # ============ 第 4 层：清理残留的 JSON 标签行（如 "以下是JSON数据：" 等引导语） ============
+        lines = cleaned.splitlines()
+        filtered_lines = []
+        skip_keywords = (
+            "json",
+            "JSON",
+            "进度计划数据",
+            "结构化输出",
+            "structured_output",
+            "all_tasks_schedule",
+            "下面是",
+            "如下为",
+            "以下为",
+            "请复制",
+            "请保存为",
+            "```",
+        )
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                # 连续空行最多保留 1 个
+                if filtered_lines and filtered_lines[-1] == "":
+                    continue
+                filtered_lines.append("")
+                continue
+            # 如果一行包含大量 { } [ ] " : , 这类 JSON 字符，直接跳过
+            json_chars = sum(stripped.count(ch) for ch in '{}[]":,')
+            if json_chars > len(stripped) * 0.2:  # JSON 字符占比超过 20%
+                continue
+            # 行内有关键词且行很短（引导语），跳过
+            lower = stripped.lower()
+            hit = any(kw.lower() in lower for kw in skip_keywords)
+            if hit and len(stripped) < 60:
+                continue
+            filtered_lines.append(line)
+        cleaned = "\n".join(filtered_lines)
+
+        # ============ 最终 trim ============
+        cleaned = cleaned.strip()
+        if cleaned:
+            answer_text = cleaned
 
     # 如果没收到 message_end，说明流式被异常中断或人工介入卡住了
     if not got_message_end and not answer_text:
