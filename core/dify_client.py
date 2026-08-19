@@ -141,7 +141,7 @@ def call_dify_chatflow(
             )
             # 兜底：chatflow 不会把自定义结构化输出放进 message_end.metadata.outputs，
             # 若流式响应里没解析出 plan，就通过「会话变量」接口读取 conversation.plan
-            if not structured_output and conv_id:
+            if conv_id:
                 plan = _fetch_plan_from_conversation(conv_id, headers)
                 if plan:
                     structured_output = plan
@@ -227,6 +227,7 @@ def _do_stream_request(
 
             if event == "message":
                 # 增量推送的文字片段
+                new_conversation_id = evt.get("conversation_id") or new_conversation_id
                 answer_parts.append(evt.get("answer", ""))
 
             elif event == "message_replace":
@@ -236,11 +237,12 @@ def _do_stream_request(
 
             elif event == "agent_message":
                 # Agent 模式下的文字输出
+                new_conversation_id = evt.get("conversation_id") or new_conversation_id
                 answer_parts.append(evt.get("answer", ""))
 
             elif event == "message_end":
                 got_message_end = True
-                new_conversation_id = evt.get("conversation_id")
+                new_conversation_id = evt.get("conversation_id") or new_conversation_id
                 metadata = evt.get("metadata") or {}
                 # Dify 工作流 answer 节点中若有结构化输出，优先从 outputs 拿
                 outputs = metadata.get("outputs") if isinstance(metadata, dict) else None
@@ -249,8 +251,9 @@ def _do_stream_request(
                 if isinstance(outputs, dict):
                     # 兼容某些节点直接把 fields 放进 outputs（如 structured_output / plan）
                     for key in ("structured_output", "plan", "output"):
-                        if key in outputs and isinstance(outputs[key], dict):
-                            structured_output = outputs[key]
+                        candidate = _coerce_plan(outputs.get(key))
+                        if candidate:
+                            structured_output = candidate
                             break
                     # 兼容：outputs 本身就是 structured_output（无外层 key）
                     if not structured_output and (
@@ -289,11 +292,13 @@ def _do_stream_request(
 
             elif event == "workflow_started":
                 last_progress_time = time.time()
+                new_conversation_id = evt.get("conversation_id") or new_conversation_id
                 if on_progress:
                     on_progress("AI 开始处理您的请求...")
 
             elif event == "workflow_finished":
                 last_progress_time = time.time()
+                new_conversation_id = evt.get("conversation_id") or new_conversation_id
                 if on_progress:
                     on_progress("处理完成，正在整理结果...")
                 # 兼容某些 Dify 版本：workflow_finished 里可能带 outputs
@@ -302,8 +307,9 @@ def _do_stream_request(
                     outputs = wf_data.get("outputs") or {}
                     if isinstance(outputs, dict):
                         for key in ("structured_output", "plan", "output"):
-                            if key in outputs and isinstance(outputs[key], dict):
-                                structured_output = outputs[key]
+                            candidate = _coerce_plan(outputs.get(key))
+                            if candidate:
+                                structured_output = candidate
                                 break
 
             elif event == "ping":
@@ -575,6 +581,29 @@ def _unwrap_any_plan(data: Any) -> Dict[str, Any]:
     return {}
 
 
+def _coerce_plan(value: Any) -> Dict[str, Any]:
+    """把计划变量可能出现的字符串、包装对象统一解包。"""
+    if isinstance(value, dict):
+        direct = _unwrap_any_plan(value)
+        if direct:
+            return direct
+        for key in ("value", "data", "content", "text", "plan", "output"):
+            if key in value:
+                result = _coerce_plan(value[key])
+                if result:
+                    return result
+        return {}
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw or raw == "1234":
+            return {}
+        try:
+            return _coerce_plan(json.loads(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+    return {}
+
+
 def _fetch_plan_from_conversation(conversation_id: str, headers: dict) -> Dict[str, Any]:
     """从 Dify「会话变量」接口读取 conversation.plan，兜底获取最终进度计划 JSON。
 
@@ -584,40 +613,37 @@ def _fetch_plan_from_conversation(conversation_id: str, headers: dict) -> Dict[s
     """
     if not conversation_id:
         return {}
-    try:
-        base_url = DIFY_CHATFLOW_URL.rsplit("/chat-messages", 1)[0]
-        url = f"{base_url}/conversations/{conversation_id}/variables"
-        resp = requests.get(
-            url,
-            headers={"Authorization": headers["Authorization"]},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        items = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(items, list):
-            items = payload if isinstance(payload, list) else []
-        for var in items:
-            if not isinstance(var, dict):
-                continue
-            if var.get("name") != "plan":
-                continue
-            raw = var.get("value")
-            parsed: Any = raw
-            if isinstance(raw, str):
-                raw = raw.strip()
-                if not raw or raw == "1234":  # 初始占位值，跳过
+    base_url = DIFY_CHATFLOW_URL.rsplit("/chat-messages", 1)[0]
+    url = f"{base_url}/conversations/{conversation_id}/variables"
+    request_headers = {"Authorization": headers["Authorization"]}
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, headers=request_headers, timeout=30)
+            resp.raise_for_status()
+            payload = resp.json()
+            candidates = []
+            if isinstance(payload, dict):
+                candidates.extend(payload.get("data", []) if isinstance(payload.get("data"), list) else [])
+                candidates.extend(payload.get("variables", []) if isinstance(payload.get("variables"), list) else [])
+                candidates.append(payload)
+            elif isinstance(payload, list):
+                candidates.extend(payload)
+
+            for var in candidates:
+                if not isinstance(var, dict):
                     continue
-                try:
-                    parsed = json.loads(raw)
-                except Exception:
-                    parsed = {}
-            if isinstance(parsed, dict):
-                unwrapped = _unwrap_any_plan(parsed)
-                if unwrapped:
-                    return unwrapped
-    except Exception:
-        return {}
+                if var.get("name") == "plan":
+                    plan = _coerce_plan(var.get("value", var))
+                    if plan:
+                        return plan
+                # 兼容返回 {plan: ...} 或 data 内嵌变量对象
+                plan = _coerce_plan(var.get("plan"))
+                if plan:
+                    return plan
+        except (requests.RequestException, ValueError, TypeError):
+            pass
+        if attempt < 2:
+            time.sleep(1)
     return {}
 
 
