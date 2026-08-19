@@ -773,9 +773,9 @@ def render_chat_panel():
     - 进度反馈：实时显示 AI 当前执行到哪个节点
     """
     st.markdown("""
-    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 12px 16px; border-radius: 8px; color: white; margin-bottom: 8px;">
-        <h4 style="color: white; margin: 0;">🤖 AI 智能对话</h4>
-        <p style="margin: 4px 0 0 0; opacity: 0.92; font-size: 0.85rem; line-height: 1.5;">
+    <div style="background: linear-gradient(135deg, #4f6fe8 0%, #7447a8 100%); padding: 22px 24px; border-radius: 14px; color: white; margin-bottom: 14px; box-shadow: 0 8px 22px rgba(79, 70, 229, 0.18);">
+        <h2 style="color: white; margin: 0; font-size: 1.45rem;">🤖 AI 智能对话助手</h2>
+        <p style="margin: 8px 0 0 0; opacity: 0.94; font-size: 0.95rem; line-height: 1.7;">
             描述项目需求或上传 Word/文档 → AI 返回<b>文字说明</b>，并自动在网页下方渲染甘特图与资源曲线。<br>
             💡 支持两种使用方式：① 直接生成新计划 ② 在已有计划基础上进行优化（如延期、压缩）。
         </p>
@@ -1027,7 +1027,10 @@ def main():
         .main .block-container { padding-top: 0.5rem; padding-bottom: 0.5rem; max-width: 100%; }
         [data-testid="stMetricValue"] { font-size: 1.1rem; }
         h1, h2, h3 { font-family: "Microsoft YaHei", "微软雅黑", sans-serif; }
-        .stChatMessage { padding: 0.5rem 0; }
+        /* 把右侧区域做成真正的主聊天面板，而不是窄小的附属卡片 */
+        .stChatMessage { width: 100%; max-width: 100%; padding: 14px 18px; margin: 8px 0; border: 1px solid #e2e8f0; border-radius: 12px; background: #ffffff; box-shadow: 0 2px 8px rgba(15, 23, 42, 0.04); }
+        [data-testid="stChatMessageContent"] { width: 100%; }
+        [data-testid="stChatInput"] { width: 100%; }
         /* 聊天消息字号与行距（保证返回的长文本清晰可读） */
         .stChatMessage p, .stChatMessage li { font-size: 1.05rem; line-height: 1.8; }
         .stChatMessage code { font-size: 0.95rem; }
@@ -1088,7 +1091,7 @@ def main():
     render_workflow_banner()
 
     # ==================== 主体：左历史文件 + 右聊天框 ====================
-    left_col, right_col = st.columns([1, 3], gap="large")
+    left_col, right_col = st.columns([0.85, 4.15], gap="large")
 
     with left_col:
         # ===== 上传区 =====
