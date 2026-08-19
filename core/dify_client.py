@@ -27,27 +27,32 @@ from config import (
 # 节点标题 → 用户可读的进度描述
 # 工作流执行到对应节点时，回调会传这段文字给 UI 显示
 _NODE_TITLE_MAP: Dict[str, str] = {
+    "0.1对话意图识别": "正在识别您的请求意图...",
     "1.1综合参数提取": "正在提取项目参数...",
     "1.2边界条件补充": "正在补充边界条件...",
     "1.3WBS一二级+粗颗粒逻辑": "正在生成工作分解结构（WBS）...",
     "1.4WBS三级生成": "正在细化 WBS 三级任务...",
     "1.5WBS审查": "正在审查 WBS 结构...",
     "2.1工序依赖关系": "正在计算工序依赖关系...",
+    "2.2CPM": "正在计算关键路径（CPM）...",
+    "2.3资源定额计算": "正在计算资源定额...",
     "3.1资源调优": "正在进行资源调优...",
     "3.2进度方案生成": "正在生成进度方案...",
     "4.1方案审核": "正在审核方案逻辑...",
     "4.2方案重生成": "正在重新生成方案...",
-    "5.1人员配置": "正在计算人员配置...",
-    "5.2资源荷载": "正在计算设备资源荷载...",
-    "5.3横道图": "正在整理横道图数据...",
     "6.1扰动事件解析": "正在解析扰动事件...",
     "6.2生成更新方案": "正在生成更新方案...",
     "6.3进度方案生成": "正在生成优化后的进度方案...",
-    "可视化": "正在生成方案摘要...",
-    "LLM 19": "正在输出最终方案...",
-    "输出整理": "正在整理输出...",
+    "循环": "正在自动审核并优化方案...",
+    "退出循环": "方案已通过审核，正在完成处理...",
+    "变量聚合器": "正在汇总方案数据...",
+    "合并": "正在合并方案数据...",
+    "参数黑板": "正在保存中间参数...",
+    "赋值plan": "正在保存方案数据...",
+    "赋值plan2": "正在保存调整后的方案数据...",
+    "中文计划说明书": "正在整理中文进度计划说明书...",
+    "中文计划说明书2": "正在整理中文进度计划说明书...",
     "输出整理2": "正在整理输出...",
-    "输出整理4": "正在整理输出...",
     "输出整理5": "正在整理输出...",
 }
 
@@ -129,11 +134,18 @@ def call_dify_chatflow(
     last_error: Exception | None = None
     for attempt in range(1, DIFY_MAX_RETRIES + 1):
         try:
-            return _do_stream_request(
+            answer_text, structured_output, conv_id = _do_stream_request(
                 headers=headers,
                 payload=payload,
                 on_progress=on_progress,
             )
+            # 兜底：chatflow 不会把自定义结构化输出放进 message_end.metadata.outputs，
+            # 若流式响应里没解析出 plan，就通过「会话变量」接口读取 conversation.plan
+            if not structured_output and conv_id:
+                plan = _fetch_plan_from_conversation(conv_id, headers)
+                if plan:
+                    structured_output = plan
+            return answer_text, structured_output, conv_id
         except _BusinessError as exc:
             # 业务错误（AI 返回 error 事件）不重试，直接抛出
             raise RuntimeError(str(exc)) from exc
@@ -190,9 +202,9 @@ def _do_stream_request(
         for raw_line in resp.iter_lines():
             if not raw_line:
                 # 空行时检查是否长时间卡住（超过 180 秒没事件就当卡住了）
-                if last_node_title and time.time() - last_progress_time > 180:
+                if last_node_title and time.time() - last_progress_time > 600:
                     answer_parts.append(
-                        f"\n\n⚠️ 工作流执行时间过长，已停留在「{last_node_title}」阶段超过 3 分钟。"
+                        f"\n\n⚠️ 工作流执行时间过长，已停留在「{last_node_title}」阶段超过 10 分钟。"
                         " 可能原因：① Dify 工作流触发了人工介入节点，请在 Dify 后台处理后重试；"
                         " ② 项目参数过于复杂，建议拆分成多个小步骤提交。"
                     )
@@ -514,6 +526,101 @@ def _do_stream_request(
     return answer_text, structured_output, new_conversation_id
 
 
+def _unwrap_any_plan(data: Any) -> Dict[str, Any]:
+    """从任意形式（含多种外层 key / 多层嵌套）的 data 中解出实际的 plan dict。
+
+    返回的 dict 直接包含 overview / all_tasks_schedule（扁平形式）。
+    如果解不出来，返回空 dict {}。
+    """
+    if not isinstance(data, dict):
+        return {}
+
+    # 形式 A：data 本身就是扁平计划
+    if "overview" in data and "all_tasks_schedule" in data:
+        return data
+
+    # 形式 B：含多种常见外层 key
+    outer_keys = (
+        "structured_output",
+        "plan",
+        "output",
+        "result",
+        "adjusted_plan",
+        "optimized_plan",
+        "updated_plan",
+        "updated_schedule",
+        "adjusted_schedule",
+        "optimized_schedule",
+        "new_schedule",
+        "final_plan",
+        "delay_adjusted_plan",
+        "generated_plan",
+        "progress_plan",
+    )
+    for key in outer_keys:
+        inner = data.get(key)
+        if isinstance(inner, dict):
+            if "overview" in inner and "all_tasks_schedule" in inner:
+                return inner
+            # 可能还有一层，递归解一次
+            deeper = _unwrap_any_plan(inner)
+            if deeper:
+                return deeper
+
+    # 形式 C：再兜底扫一遍所有 dict 值，看看有没有值是 {overview, all_tasks_schedule}
+    for v in data.values():
+        if isinstance(v, dict) and "overview" in v and "all_tasks_schedule" in v:
+            return v
+
+    return {}
+
+
+def _fetch_plan_from_conversation(conversation_id: str, headers: dict) -> Dict[str, Any]:
+    """从 Dify「会话变量」接口读取 conversation.plan，兜底获取最终进度计划 JSON。
+
+    Chatflow 应用不会把自定义结构化输出写进 message_end.metadata.outputs，
+    但 conversation.plan 会在工作流执行期间被 赋值plan / 赋值plan2 更新为最终 JSON 字符串，
+    这里通过 Dify 官方「List Conversation Variables」接口读回来，并解包成扁平 plan dict。
+    """
+    if not conversation_id:
+        return {}
+    try:
+        base_url = DIFY_CHATFLOW_URL.rsplit("/chat-messages", 1)[0]
+        url = f"{base_url}/conversations/{conversation_id}/variables"
+        resp = requests.get(
+            url,
+            headers={"Authorization": headers["Authorization"]},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        items = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            items = payload if isinstance(payload, list) else []
+        for var in items:
+            if not isinstance(var, dict):
+                continue
+            if var.get("name") != "plan":
+                continue
+            raw = var.get("value")
+            parsed: Any = raw
+            if isinstance(raw, str):
+                raw = raw.strip()
+                if not raw or raw == "1234":  # 初始占位值，跳过
+                    continue
+                try:
+                    parsed = json.loads(raw)
+                except Exception:
+                    parsed = {}
+            if isinstance(parsed, dict):
+                unwrapped = _unwrap_any_plan(parsed)
+                if unwrapped:
+                    return unwrapped
+    except Exception:
+        return {}
+    return {}
+
+
 def _try_parse_structured_from_text(text: str) -> Dict[str, Any]:
     """尝试从 AI 回答文本里抓取符合绘图结构的 JSON。
 
@@ -529,54 +636,6 @@ def _try_parse_structured_from_text(text: str) -> Dict[str, Any]:
         return {}
 
     import re
-
-    def _unwrap_any_plan(data: Any) -> Dict[str, Any]:
-        """从任意形式（含多种外层 key / 多层嵌套）的 data 中解出实际的 plan dict。
-
-        返回的 dict 直接包含 overview / all_tasks_schedule（扁平形式）。
-        如果解不出来，返回空 dict {}。
-        """
-        if not isinstance(data, dict):
-            return {}
-
-        # 形式 A：data 本身就是扁平计划
-        if "overview" in data and "all_tasks_schedule" in data:
-            return data
-
-        # 形式 B：含多种常见外层 key
-        outer_keys = (
-            "structured_output",
-            "plan",
-            "output",
-            "result",
-            "adjusted_plan",
-            "optimized_plan",
-            "updated_plan",
-            "updated_schedule",
-            "adjusted_schedule",
-            "optimized_schedule",
-            "new_schedule",
-            "final_plan",
-            "delay_adjusted_plan",
-            "generated_plan",
-            "progress_plan",
-        )
-        for key in outer_keys:
-            inner = data.get(key)
-            if isinstance(inner, dict):
-                if "overview" in inner and "all_tasks_schedule" in inner:
-                    return inner
-                # 可能还有一层，递归解一次
-                deeper = _unwrap_any_plan(inner)
-                if deeper:
-                    return deeper
-
-        # 形式 C：再兜底扫一遍所有 dict 值，看看有没有值是 {overview, all_tasks_schedule}
-        for v in data.values():
-            if isinstance(v, dict) and "overview" in v and "all_tasks_schedule" in v:
-                return v
-
-        return {}
 
     code_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL | re.IGNORECASE)
     if code_match:
